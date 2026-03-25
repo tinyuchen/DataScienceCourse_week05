@@ -55,7 +55,7 @@ def main():
 
     # 取得股價資料（日期對齊）:contentReference[oaicite:16]{index=16}
     start = pd.to_datetime(daily["date"]).min().date().isoformat()
-    end = (pd.to_datetime(daily["date"]).max().date() + pd.Timedelta(days=2)).date().isoformat()
+    end = (pd.to_datetime(daily["date"]).max() + pd.Timedelta(days=2)).date().isoformat()
 
     stock = fetch_stock_csv(args.stock, start, end, args.stock_csv)
     stock["date"] = stock["date"].astype(str)
