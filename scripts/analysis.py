@@ -1,116 +1,53 @@
-import argparse
 import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
 import yfinance as yf
-from pathlib import Path
-
-
-def fetch_stock_csv(symbol: str, start: str, end: str, out_csv: str):
-    df = yf.download(symbol, start=start, end=end, auto_adjust=False, progress=False)
-    if df.empty:
-        raise RuntimeError(f"yfinance download empty for {symbol} ({start}~{end})")
-    df = df.reset_index()
-    df["date"] = pd.to_datetime(df["Date"]).dt.date.astype(str)
-    df["close"] = df["Close"].astype(float)
-    stock = df[["date", "close"]].copy()
-    stock.to_csv(out_csv, index=False, encoding="utf-8-sig")
-    return stock
-
-
-def daily_summary_rule(sent_sum: float, n: int) -> str:
-    if n == 0:
-        return "No news collected today."
-    if sent_sum >= 2:
-        return "今日新聞情緒偏正面，可能帶來上行支撐（僅供參考）。"
-    if sent_sum <= -2:
-        return "今日新聞情緒偏負面，可能帶來下行壓力（僅供參考）。"
-    return "今日新聞情緒偏中性，市場可能以盤整或事件驅動為主（僅供參考）。"
-
+import matplotlib.pyplot as plt
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import r2_score
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--stock", default="2330.TW", help="台股通常用 .TW，例如 2330.TW")
-    ap.add_argument("--news_csv", default="data/news.csv")
-    ap.add_argument("--stock_csv", default="data/stock.csv")
-    ap.add_argument("--out_png", default="output/result.png")
-    args = ap.parse_args()
+    STOCK_ID = "2330.TW"
+    START = "2023-01-01"
+    END   = "2024-12-31"
 
-    Path("output").mkdir(parents=True, exist_ok=True)
-    Path("data").mkdir(parents=True, exist_ok=True)
+    # stock
+    df_stock = yf.download(STOCK_ID, start=START, end=END, progress=False).reset_index()
+    df_stock = df_stock.rename(columns={"Date":"date", "Close":"close"})
+    df_stock["date"] = pd.to_datetime(df_stock["date"]).dt.date
+    df_stock = df_stock[["date","close"]].dropna()
+    df_stock.to_csv("data/stock.csv", index=False, encoding="utf-8-sig")
 
-    news = pd.read_csv(args.news_csv, encoding="utf-8-sig")
-    news = news.dropna(subset=["date", "title"]).copy()
+    # news
+    df_news = pd.read_csv("data/news.csv")
+    df_news["date"] = pd.to_datetime(df_news["date"]).dt.date
+    daily_sent = df_news.groupby("date").agg(
+        daily_sent_sum=("sentiment_score","sum"),
+        daily_sent_mean=("sentiment_score","mean"),
+        news_count=("sentiment_score","size")
+    ).reset_index()
 
-    # 確保有 sentiment_value
-    if "sentiment_value" not in news.columns:
-        raise RuntimeError("news.csv missing sentiment_value. Run scripts/sentiment.py first.")
+    df_s = df_stock.copy()
+    df_s["ret0"] = df_s["close"].pct_change()
+    df_s["ret1"] = df_s["ret0"].shift(-1)
 
-    # 每日情緒總分（作業要求）:contentReference[oaicite:15]{index=15}
-    daily = (news.groupby("date")
-                  .agg(sent_sum=("sentiment_value", "sum"),
-                       sent_mean=("sentiment_value", "mean"),
-                       news_count=("sentiment_value", "size"))
-                  .reset_index())
+    df_m = df_s.merge(daily_sent, on="date", how="left")
+    df_m[["daily_sent_sum","daily_sent_mean","news_count"]] = df_m[["daily_sent_sum","daily_sent_mean","news_count"]].fillna(0)
 
-    # 取得股價資料（日期對齊）:contentReference[oaicite:16]{index=16}
-    start = pd.to_datetime(daily["date"]).min().date().isoformat()
-    end = (pd.to_datetime(daily["date"]).max() + pd.Timedelta(days=2)).date().isoformat()
+    corr_next = df_m[["daily_sent_sum","ret1"]].dropna().corr().iloc[0,1]
 
-    stock = fetch_stock_csv(args.stock, start, end, args.stock_csv)
-    stock["date"] = stock["date"].astype(str)
-    stock["close"] = stock["close"].astype(float)
-    stock = stock.sort_values("date").reset_index(drop=True)
-    stock["ret0"] = stock["close"].pct_change()              # 當日報酬
-    stock["ret1"] = stock["ret0"].shift(-1)                  # 隔日報酬（用來看新聞→隔日）
+    tmp = df_m.dropna(subset=["ret1"]).copy()
+    X = tmp[["daily_sent_sum","news_count"]].values
+    y = tmp["ret1"].values
+    lr = LinearRegression().fit(X, y)
+    r2 = r2_score(y, lr.predict(X))
 
-    # 合併：以股價交易日為主（有些日期沒交易就會對不到）
-    merged = stock.merge(daily, on="date", how="left")
-    merged[["sent_sum","sent_mean","news_count"]] = merged[["sent_sum","sent_mean","news_count"]].fillna(0)
-
-    # 市場影響：情緒總分 vs 隔日報酬（初步）:contentReference[oaicite:17]{index=17}
-    valid = merged.dropna(subset=["ret1"]).copy()
-    corr = valid[["sent_sum","ret1"]].corr().iloc[0,1]
-    print(f"Corr(sent_sum, next_day_return) = {corr:.4f}")
-
-    # AI 摘要（加分）：用規則版產生每日摘要文字（不需外部 API）:contentReference[oaicite:18]{index=18}
-    merged["daily_summary"] = merged.apply(
-        lambda r: daily_summary_rule(r["sent_sum"], int(r["news_count"])),
-        axis=1
-    )
-    merged.to_csv("output/merged_daily.csv", index=False, encoding="utf-8-sig")
-
-    # 視覺化：3 張圖（用 1 張 result.png 三個區塊呈現）:contentReference[oaicite:19]{index=19}
-    fig = plt.figure(figsize=(14, 10))
-
-    # (1) 情緒趨勢
-    ax1 = plt.subplot(3, 1, 1)
-    ax1.plot(pd.to_datetime(merged["date"]), merged["sent_sum"], marker="o", linewidth=1)
-    ax1.axhline(0, linestyle="--")
-    ax1.set_title("Daily News Sentiment Sum (Positive=+1, Neutral=0, Negative=-1)")
-    ax1.set_ylabel("sent_sum")
-
-    # (2) 股價趨勢
-    ax2 = plt.subplot(3, 1, 2, sharex=ax1)
-    ax2.plot(pd.to_datetime(merged["date"]), merged["close"])
-    ax2.set_title(f"Stock Close Price: {args.stock}")
-    ax2.set_ylabel("close")
-
-    # (3) 情緒 vs 隔日報酬（散點）
-    ax3 = plt.subplot(3, 1, 3)
-    ax3.scatter(valid["sent_sum"], valid["ret1"])
-    ax3.set_title(f"Sentiment vs Next-day Return (corr={corr:.3f})")
-    ax3.set_xlabel("sent_sum")
-    ax3.set_ylabel("next_day_return")
-
+    # plots
+    fig = plt.figure(figsize=(14,10))
+    ax1 = plt.subplot(3,1,1); ax1.plot(df_m["date"], df_m["daily_sent_sum"]); ax1.set_title("Daily Sentiment (sum)")
+    ax2 = plt.subplot(3,1,2); ax2.plot(df_m["date"], df_m["close"]); ax2.set_title(f"Close Price: {STOCK_ID}")
+    ax3 = plt.subplot(3,1,3); ax3.scatter(df_m["daily_sent_sum"], df_m["ret1"], s=10); ax3.set_title(f"Sentiment vs Next-day Return (corr={corr_next:.3f}, R2={r2:.4f})")
     plt.tight_layout()
-    plt.savefig(args.out_png, dpi=200)
-    plt.close(fig)
-
-    print(f"✅ wrote {args.stock_csv}")
-    print(f"✅ wrote {args.out_png}")
-    print("✅ wrote output/merged_daily.csv (含每日摘要)")
-
+    plt.savefig("output/result.png", dpi=200)
+    print("saved output/result.png")
 
 if __name__ == "__main__":
     main()
